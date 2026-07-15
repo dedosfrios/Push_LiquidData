@@ -15,6 +15,7 @@ function ejecutarMonitoreoOperativo() {
   const masterDBDatalake = extraerDatalakeMasterDB();
   
   // Lectura del universo completo del Masterfile base de planificación
+  const rawMaster = SpreadsheetApp.openById(ENTORNO.MASTERFILE_ID).getSheets()[0].getDataRange().getValues();
   const headersMaster = rawMaster[0].map(h => String(h).trim());
   
   const idxFecha = headersMaster.indexOf("Fecha");
