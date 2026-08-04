@@ -56,3 +56,16 @@ function debugAdobeEnVivo() {
     mostrados++;
   }
 }
+
+function debugHeadersMasterDB() {
+  const config = _obtenerConfiguracionEntorno();
+  const rawData = SpreadsheetApp.openById(config.MASTER_APP_ID).getSheets()[0].getDataRange().getValues();
+  const headers = rawData[0].map(h => String(h).trim());
+
+  Logger.log("=== ENCABEZADOS MasterDB (con índice) ===");
+  headers.forEach((h, idx) => Logger.log(`[${idx}] "${h}"`));
+
+  Logger.log("\n=== FILA DE MUESTRA (fila 2, cruda) ===");
+  const sampleRow = rawData[1] || [];
+  headers.forEach((h, idx) => Logger.log(`"${h}" = ${sampleRow[idx]}`));
+}
