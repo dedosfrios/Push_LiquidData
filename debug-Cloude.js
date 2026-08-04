@@ -69,3 +69,150 @@ function debugHeadersMasterDB() {
   const sampleRow = rawData[1] || [];
   headers.forEach((h, idx) => Logger.log(`"${h}" = ${sampleRow[idx]}`));
 }
+
+// =========================================================================
+// ARCHIVO: 8_Debug_ConsolidadoAuditoria.gs
+// DESCRIPCIÓN: Diagnóstico de SOLO LECTURA para 3_Escultor_Consolidado.gs.
+//              No modifica ni escribe nada. Solo audita.
+// =========================================================================
+
+function debugAuditoriaConsolidado() {
+  Logger.log("========================================================");
+  Logger.log("🔍 AUDITORÍA DE 3_Escultor_Consolidado.gs (solo lectura)");
+  Logger.log("========================================================");
+
+  const rsApp = extraerDatalakeAirshipAvanzado();
+  const rsWeb = extraerDatalakeAirshipWeb();
+  const rsMasterApp = extraerDatalakeMasterDB();
+  const rsMasterWeb = extraerDatalakeMasterWebDB();
+  const rsAdobe = extraerDatalakeAdobe();
+
+  const modulosNombrados = [
+    { nombre: "AirshipApp", rs: rsApp },
+    { nombre: "AirshipWeb", rs: rsWeb },
+    { nombre: "MasterApp", rs: rsMasterApp },
+    { nombre: "MasterWeb", rs: rsMasterWeb },
+    { nombre: "Adobe", rs: rsAdobe }
+  ];
+
+  // -----------------------------------------------------------------
+  // PASO 1: Tamaños de cada mapa (sanity check rápido)
+  // -----------------------------------------------------------------
+  Logger.log("\n--- PASO 1: Tamaño de cada datalake ---");
+  modulosNombrados.forEach(m => {
+    Logger.log(`${m.nombre}: mapaData.size = ${m.rs.mapaData.size} | encabezados = [${m.rs.encabezados.join(", ")}]`);
+  });
+
+  // -----------------------------------------------------------------
+  // PASO 2: Detección de colisiones de nombres de columna entre fuentes
+  // -----------------------------------------------------------------
+  Logger.log("\n--- PASO 2: Colisiones de headers entre fuentes ---");
+  const columnasExcluidas = new Set(["", "Custom Objects Raw", "Notification Name", "IED", "IED_Sanitizado"]);
+  const headerAOrigenes = new Map(); // header -> [nombres de módulos que lo tienen]
+
+  modulosNombrados.forEach(m => {
+    m.rs.encabezados.forEach(h => {
+      if (columnasExcluidas.has(h)) return;
+      if (!headerAOrigenes.has(h)) headerAOrigenes.set(h, []);
+      headerAOrigenes.get(h).push(m.nombre);
+    });
+  });
+
+  let colisionesEncontradas = 0;
+  for (const [header, origenes] of headerAOrigenes.entries()) {
+    if (origenes.length > 1) {
+      colisionesEncontradas++;
+      Logger.log(`  ⚠️ "${header}" aparece en: ${origenes.join(", ")} -> en el superObjeto, "${origenes[origenes.length - 1]}" pisará a los anteriores según el orden de spread ({...master, ...app/web, ...adobe}).`);
+    }
+  }
+  if (colisionesEncontradas === 0) {
+    Logger.log("  ✅ No se encontraron colisiones de nombres de columna entre fuentes.");
+  } else {
+    Logger.log(`  Total de columnas en colisión: ${colisionesEncontradas}`);
+  }
+
+  // -----------------------------------------------------------------
+  // PASO 3: Verificar consistencia de llaves (claveUniversal) entre
+  // datalakeApp/datalakeWeb y sus respectivos masterMap/adobeMap
+  // -----------------------------------------------------------------
+  Logger.log("\n--- PASO 3: Cobertura de matching APP (Airship <-> MasterApp <-> Adobe) ---");
+  let matchMasterApp = 0, matchAdobeApp = 0;
+  for (const claveUniversal of rsApp.mapaData.keys()) {
+    if (rsMasterApp.mapaData.has(claveUniversal)) matchMasterApp++;
+    if (rsAdobe.mapaData.has(claveUniversal)) matchAdobeApp++;
+  }
+  Logger.log(`  Total IEDs en AirshipApp: ${rsApp.mapaData.size}`);
+  Logger.log(`  Con match en MasterApp: ${matchMasterApp} (${((matchMasterApp / rsApp.mapaData.size) * 100).toFixed(1)}%)`);
+  Logger.log(`  Con match en Adobe: ${matchAdobeApp} (${((matchAdobeApp / rsApp.mapaData.size) * 100).toFixed(1)}%)`);
+
+  Logger.log("\n--- PASO 3b: Cobertura de matching WEB (Airship <-> MasterWeb <-> Adobe) ---");
+  let matchMasterWeb = 0, matchAdobeWeb = 0;
+  for (const claveUniversal of rsWeb.mapaData.keys()) {
+    if (rsMasterWeb.mapaData.has(claveUniversal)) matchMasterWeb++;
+    if (rsAdobe.mapaData.has(claveUniversal)) matchAdobeWeb++;
+  }
+  Logger.log(`  Total IEDs en AirshipWeb: ${rsWeb.mapaData.size}`);
+  Logger.log(`  Con match en MasterWeb: ${matchMasterWeb} (${((matchMasterWeb / rsWeb.mapaData.size) * 100).toFixed(1)}%)`);
+  Logger.log(`  Con match en Adobe: ${matchAdobeWeb} (${((matchAdobeWeb / rsWeb.mapaData.size) * 100).toFixed(1)}%)`);
+
+  // -----------------------------------------------------------------
+  // PASO 4: Muestra real de una fila combinada (APP) para inspección visual
+  // -----------------------------------------------------------------
+  Logger.log("\n--- PASO 4: Muestra de fila combinada real (primer IED de AirshipApp) ---");
+  const primeraClave = rsApp.mapaData.keys().next().value;
+  if (primeraClave) {
+    const appData = rsApp.mapaData.get(primeraClave);
+    const masterData = rsMasterApp.mapaData.get(primeraClave) || {};
+    const adobeData = rsAdobe.mapaData.get(primeraClave) || {};
+    const superObjeto = { ...masterData, ...appData, ...adobeData };
+    Logger.log(`Clave: "${primeraClave}"`);
+    Logger.log("superObjeto resultante: " + JSON.stringify(superObjeto));
+  }
+
+  // -----------------------------------------------------------------
+  // PASO 5: Buscar valores vacíos/undefined sospechosos en columnas clave
+  // -----------------------------------------------------------------
+  Logger.log("\n--- PASO 5: Chequeo de columnas potencialmente vacías en la data consolidada ---");
+  const superSetHeaders = new Set();
+  modulosNombrados.forEach(m => {
+    m.rs.encabezados.forEach(h => { if (!columnasExcluidas.has(h)) superSetHeaders.add(h); });
+  });
+  const masterHeaders = ["Canal", "IED", ...Array.from(superSetHeaders)];
+
+  const construirFilaCompleta = (canal, ied, objCombinado) => {
+    return masterHeaders.map(header => {
+      if (header === "Canal") return canal;
+      if (header === "IED") return ied;
+      return objCombinado[header] !== undefined ? objCombinado[header] : "";
+    });
+  };
+
+  const columnaVacios = {};
+  masterHeaders.forEach(h => columnaVacios[h] = 0);
+  let filasRevisadas = 0;
+
+  for (const [claveUniversal, appData] of rsApp.mapaData.entries()) {
+    const masterData = rsMasterApp.mapaData.get(claveUniversal) || {};
+    const adobeData = rsAdobe.mapaData.get(claveUniversal) || {};
+    const superObjeto = { ...masterData, ...appData, ...adobeData };
+    const fila = construirFilaCompleta("APP", appData.__displayIed, superObjeto);
+    fila.forEach((val, idx) => {
+      if (val === "" || val === null || val === undefined) columnaVacios[masterHeaders[idx]]++;
+    });
+    filasRevisadas++;
+  }
+
+  Logger.log(`Filas APP revisadas: ${filasRevisadas}`);
+  Logger.log("Columnas con celdas vacías (top 15, ordenado desc):");
+  Object.entries(columnaVacios)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15)
+    .forEach(([h, count]) => {
+      const pct = ((count / filasRevisadas) * 100).toFixed(1);
+      Logger.log(`  "${h}": ${count}/${filasRevisadas} vacías (${pct}%)`);
+    });
+
+  Logger.log("\n========================================================");
+  Logger.log("🔍 FIN AUDITORÍA");
+  Logger.log("========================================================");
+}
