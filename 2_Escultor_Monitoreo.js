@@ -1,22 +1,51 @@
 // =========================================================================
 // ARCHIVO: 2_Escultor_Monitoreo.gs
-// DESCRIPCIÓN: Capa 3 - Orquestador, Transformador y Persistencia (BI)
+// DESCRIPCIÓN: Capa 3 - Orquestador, Transformador y Persistencia Segura (BI)
 // =========================================================================
 
 /**
- * FUNCIÓN EJECUTABLE DE PRODUCCIÓN: Actualiza el reporte operativo diario.
- * Coordina la extracción en RAM, resuelve el conflicto de llaves, unifica nombres
- * de columnas y corrige la lectura de visitas a PDP desde el datalake de Adobe.
+ * Helper O(k): Traductor en RAM y Sanitizador de Tipos. 
+ * Escanea el Datalake crudo, encuentra el valor numérico (tolerando variaciones de nombre),
+ * y purga comas o formatos de texto antes de castearlo a número.
  */
+function _leerMetricaTolerante(objeto, variacionesAceptadas) {
+  if (!objeto || Object.keys(objeto).length === 0) return 0;
+  
+  const llavesReales = Object.keys(objeto);
+  const variacionesLimpias = variacionesAceptadas.map(v => String(v).toLowerCase().replace(/[_ ]/g, ''));
+  
+  for (let i = 0; i < llavesReales.length; i++) {
+    const llaveLimpia = String(llavesReales[i]).toLowerCase().replace(/[_ ]/g, '');
+    if (variacionesLimpias.includes(llaveLimpia)) {
+      
+      const rawValue = objeto[llavesReales[i]];
+      if (rawValue === undefined || rawValue === null || rawValue === "") return 0;
+      
+      // Aplicamos Regex para limpiar comas de miles y espacios (ej. "1,234.50" -> "1234.50")
+      const stringLimpio = String(rawValue).replace(/,/g, '').replace(/[^\d.-]/g, '');
+      const numeroParseado = parseFloat(stringLimpio);
+      
+      // Si a pesar de la limpieza resulta en NaN, devolvemos 0 para no romper cálculos
+      return isNaN(numeroParseado) ? 0 : numeroParseado;
+    }
+  }
+  return 0; 
+}
+
 function ejecutarMonitoreoOperativo() {
   console.time("⏱️ Pipeline Monitoreo Operativo");
   
-  // 1. EXTRACT: Invocación de los Datalakes líquidos en memoria RAM
-  const airshipDatalake = extraerDatalakeAirship();
-  const adobeDatalake = extraerDatalakeAdobe();
-  const masterDBDatalake = extraerDatalakeMasterDB();
+  // =========================================================================
+  // 1. EXTRACT: Invocación de Datalakes Schema-Agnostic (RAM)
+  // =========================================================================
+  const rsAirshipApp = extraerDatalakeAirshipAvanzado();
+  const rsAdobe = extraerDatalakeAdobe();
+  const rsPushDB = extraerDatalakeMasterDB();
   
-  // Lectura del universo completo del Masterfile base de planificación
+  const airshipDatalake = rsAirshipApp.mapaData;
+  const adobeDatalake = rsAdobe.mapaData;
+  const masterDBDatalake = rsPushDB.mapaData;
+  
   const rawMaster = SpreadsheetApp.openById(ENTORNO.MASTERFILE_ID).getSheets()[0].getDataRange().getValues();
   const headersMaster = rawMaster[0].map(h => String(h).trim());
   
@@ -24,101 +53,105 @@ function ejecutarMonitoreoOperativo() {
   const idxTipo = headersMaster.indexOf("Tipo");
   const idxMundo = headersMaster.indexOf("Categoría F / Mundo");
   const idxTitulo = headersMaster.indexOf("Título");
+  const idxIed = headersMaster.indexOf("IED") !== -1 ? headersMaster.indexOf("IED") : 0;
   
-  // 2. TRANSFORM: Definición del Molde de Diseño Ampliado y Estandarizado para Looker Studio
-  const moldeVisual = [
-    "Fecha", 
-    "IED", 
-    "N° Toque",            
-    "Es_FMedia",          
-    "Texto",              
-    "Título_Planificado", 
-    "Mundo_Categoria", 
-    "Tipo_Planificado",
-    "Tipo_Real_Airship",    
-    "Volumen_Real_Airship", 
-    "Aperturas_Directas", 
-    "Open_Rate",
+  // =========================================================================
+  // 2. TRANSFORM: Definición de Estructura de Diseño (SCHEMA LOCK)
+  // =========================================================================
+  const matrizEstructura = [
+    "Fecha", "IED", "N° Toque", "Es_FMedia", "Texto", "Título_Planificado", 
+    "Mundo_Categoria", "Tipo_Planificado", "Tipo_Real_Airship", "Volumen_Real_Airship", 
+    "Aperturas_Directas", "Open_Rate",
     
     // Tráfico Web Estandarizado (Adobe Analytics)
-    "Visitas_Total", 
-    "Bounce_Rate",        
-    "Visits_PDP_Total",   // CORREGIDO: Renombrado según acuerdo de arquitectura analítica
-    "Visits_1P",          
-    "Visits_3P",          
+    "Visitas_Total", "Bounce_Rate", "Visits_PDP_Total", "Visits_1P", "Visits_3P",
     
     // Órdenes (Adobe Analytics)
-    "Orders_Total",            
-    "Orders_1P",         
-    "Orders_3P",         
+    "Orders_Total", "Orders_1P", "Orders_3P",
     
     // Monetización (Adobe Analytics)
-    "Venta_Total",        
-    "Venta_1P",           
-    "Venta_3P",           
+    "Venta_Total", "Venta_1P", "Venta_3P",
     
     // Auditoría y Semáforos
-    "Estado_Ejecucion", 
-    "Validacion_Base", 
-    "Estado_Tracking"
+    "Estado_Ejecucion", "Validacion_Base", "Estado_Tracking"
   ];
   
-  const matrizSalida = [moldeVisual];
+  const matrizSalida = [matrizEstructura];
   let conteoMatches = 0;
   
-  // Iteración sobre todo el universo de planificación (Masterfile)
   for (let i = 1; i < rawMaster.length; i++) {
     const row = rawMaster[i];
-    const ied = String(row[0]).trim();
-    if (!ied || ied === "acc1" || ied.toLowerCase() === "ied") continue; 
+    const rawIed = String(row[idxIed]).trim();
+    if (!rawIed || rawIed === "acc1" || rawIed.toLowerCase() === "ied") continue; 
     
-    // --- NORMALIZACIÓN DE FECHA (MASTERFILE) ---
-    const dMaster = new Date(row[idxFecha]);
-    const anioM = dMaster.getFullYear();
-    const mesM = String(dMaster.getMonth() + 1).padStart(2, '0');
-    const diaM = String(dMaster.getDate()).padStart(2, '0');
-    const fechaString = `${anioM}-${mesM}-${diaM}`;
-    
-    const llaveBuscarAirship = `${ied}_${fechaString}`;
-    
-    // --- SANITIZACIÓN DE LLAVE PARA MATCH EN RAM ---
-    const iedSanitizado = ied.replace(/\D/g, "");
-    
-    // Cruces en RAM a velocidad O(1)
-    const airship = airshipDatalake.get(llaveBuscarAirship) || { delivery: 0, opens: 0, existe: false };
-    
-    // CORRECCIÓN: Inicialización explícita de visitas PDP bajo la nueva propiedad del Datalake
-    const adobe = adobeDatalake.get(iedSanitizado) || { 
-      visits_Total: 0, visits_1P: 0, visits_3P: 0, visits_PDP_Total: 0, visitsPDP: 0, bounceRate: 0,
-      orders_Total: 0, orders_1P: 0, orders_3P: 0, 
-      venta_Total: 0,  venta_1P: 0,  venta_3P: 0, 
-      existe: false 
-    };
-    
-    const pushDB = masterDBDatalake.get(iedSanitizado) || { nToque: "N/D", esFMedia: "N/D", texto: "N/D" };
-    
-    if (airship.existe) {
-      conteoMatches++;
+    // --- NORMALIZACIÓN DE FECHA ---
+    let fechaString = "N/D";
+    if (idxFecha !== -1 && row[idxFecha]) {
+      const dMaster = new Date(row[idxFecha]);
+      if (!isNaN(dMaster.getTime())) {
+        const anioM = dMaster.getFullYear();
+        const mesM = String(dMaster.getMonth() + 1).padStart(2, '0');
+        const diaM = String(dMaster.getDate()).padStart(2, '0');
+        fechaString = `${anioM}-${mesM}-${diaM}`;
+      }
     }
     
-    // Métricas Derivadas
-    const openRate = airship.delivery > 0 ? (airship.opens / airship.delivery) : 0;
-    
-    // Clasificación de Audiencia Real
-    let tipoRealAirship = "NO ENVIADO";
-    if (airship.existe && airship.delivery > 0) {
-      tipoRealAirship = airship.delivery >= ENTORNO.UMBRAL_MASIVO ? "MASIVO" : "SEGMENTADO";
+    // --- CONSTRUCCIÓN DE CLAVE UNIVERSAL PARA MATCH $O(1)$ ---
+    let claveUniversal = "";
+    const matchAcc = rawIed.match(/(acc\d+)/i);
+    if (matchAcc) {
+      claveUniversal = matchAcc[1].toLowerCase();
+    } else {
+      const matchWp = rawIed.match(/(wp-?\d+)/i);
+      if (matchWp) claveUniversal = `wp${matchWp[1].replace(/\D/g, "")}`;
     }
+    
+    if (!claveUniversal) continue;
+    
+    const airship = airshipDatalake.get(claveUniversal) || {};
+    const adobe = adobeDatalake.get(claveUniversal) || {};
+    const masterDB = masterDBDatalake.get(claveUniversal) || {};
+    
+    const existeEnAirship = Object.keys(airship).length > 0;
+    const existeEnAdobe = Object.keys(adobe).length > 0;
+    if (existeEnAirship) conteoMatches++;
+    
+    // --- MAPEOS MÉTRICOS DINÁMICOS Y PURGADOS ---
+    const volDelivery = Number(airship["Total Delivery/Impression Count"]) || 0;
+    const volOpens = Number(airship["Direct Response Count"]) || 0;
+    const openRate = volDelivery > 0 ? (volOpens / volDelivery) : 0;
+    
+    const visTotal = _leerMetricaTolerante(adobe, ["Visitas Total", "Visitas_Total", "Visitas", "Visits", "Visits Total"]);
+    const visPDP = _leerMetricaTolerante(adobe, ["Visits PDP Total", "Visits_PDP_Total", "Visitas PDP", "Visits PDP"]);
+    const vis1P = _leerMetricaTolerante(adobe, ["Visits 1P", "Visits_1P", "Visitas 1P"]);
+    const vis3P = _leerMetricaTolerante(adobe, ["Visits 3P", "Visits_3P", "Visitas 3P"]);
+    
+    // AMPLIACIÓN DE DICCIONARIO: Cubrimos exportaciones en inglés y español
+    const ordersTotal = _leerMetricaTolerante(adobe, ["Orders Total", "Orders_Total", "Orders", "Pedidos", "Ordenes"]);
+    const orders1P = _leerMetricaTolerante(adobe, ["Orders 1P", "Orders_1P", "Pedidos 1P", "Ordenes 1P", "Order 1P"]);
+    const orders3P = _leerMetricaTolerante(adobe, ["Orders 3P", "Orders_3P", "Pedidos 3P", "Ordenes 3P", "Order 3P"]);
+    
+    const ventaTotal = _leerMetricaTolerante(adobe, ["Venta Total", "Venta_Total", "Ventas", "Venta", "Revenue"]);
+    const venta1P = _leerMetricaTolerante(adobe, ["Venta 1P", "Venta_1P", "Ventas 1P"]);
+    const venta3P = _leerMetricaTolerante(adobe, ["Venta 3P", "Venta_3P", "Ventas 3P"]);
+    
+    const bounceRate = _leerMetricaTolerante(adobe, ["Bounce Rate", "Bounce_Rate", "Tasa de Rebote"]);
     
     // --- LÓGICA DE AUDITORÍA (SEMÁFOROS) ---
-    const estadoEjecucion = airship.existe ? "✅ OK" : "❌ ERROR: No ejecutado en Airship";
-    const tipoPlanificado = String(row[idxTipo]).toUpperCase();
+    const tipoPlanificado = idxTipo !== -1 ? String(row[idxTipo]).toUpperCase() : "N/D";
+    
+    let tipoRealAirship = "NO ENVIADO";
+    if (existeEnAirship && volDelivery > 0) {
+      tipoRealAirship = volDelivery >= ENTORNO.UMBRAL_MASIVO ? "MASIVO" : "SEGMENTADO";
+    }
+    
+    const estadoEjecucion = existeEnAirship ? "✅ OK" : "❌ ERROR: No ejecutado en Airship";
     
     let validacionBase = "✅ OK";
-    if (airship.existe) {
-      if (tipoPlanificado.includes("GENERAL") && airship.delivery < ENTORNO.UMBRAL_MASIVO) {
+    if (existeEnAirship) {
+      if (tipoPlanificado.includes("GENERAL") && volDelivery < ENTORNO.UMBRAL_MASIVO) {
         validacionBase = "⚠️ ALERTA: Programado General pero volumen bajo (<1M)";
-      } else if (!tipoPlanificado.includes("GENERAL") && airship.delivery > 500000) {
+      } else if (!tipoPlanificado.includes("GENERAL") && volDelivery > 500000) {
         validacionBase = "⚠️ ALERTA: Programado Segmentado pero volumen excesivo";
       }
     } else {
@@ -126,74 +159,76 @@ function ejecutarMonitoreoOperativo() {
     }
     
     let estadoTracking = "✅ OK";
-    if (airship.existe) {
-      if (!adobe.existe || adobe.visits_Total === 0) {
+    if (existeEnAirship) {
+      if (!existeEnAdobe || visTotal === 0) {
         estadoTracking = "🚨 ERROR: 0 Visitas con Aperturas (URL Rota / UTM erróneo)";
       }
     } else {
       estadoTracking = "N/A";
     }
     
-    // CORRECCIÓN DE ASIGNACIÓN: Doble asignación preventiva para mitigar desajustes entre propiedades
-    const valorVisitsPDP = adobe.visits_PDP_Total !== undefined ? adobe.visits_PDP_Total : (adobe.visitsPDP || 0);
-    
-    // 3. MAPEO ESTRUCTURADO: Repositorio alineado al molde y a la data recuperada en RAM
+    // =========================================================================
+    // 3. MAPEO ESTRUCTURADO (Inyección en columnas oficiales)
+    // =========================================================================
     const repositorio = {
       "Fecha": fechaString,
-      "IED": ied,
-      "N° Toque": pushDB.nToque,
-      "Es_FMedia": pushDB.esFMedia,
-      "Texto": pushDB.texto,
-      "Título_Planificado": row[idxTitulo],
-      "Mundo_Categoria": row[idxMundo],
-      "Tipo_Planificado": row[idxTipo],
+      "IED": rawIed, 
+      "N° Toque": masterDB["N° Toque"] ?? "N/D",
+      "Es_FMedia": masterDB["Es_FMedia"] ?? "N/D",
+      "Texto": masterDB["Texto"] ?? "N/D",
+      "Título_Planificado": idxTitulo !== -1 ? row[idxTitulo] : "N/D",
+      "Mundo_Categoria": idxMundo !== -1 ? row[idxMundo] : "N/D",
+      "Tipo_Planificado": idxTipo !== -1 ? row[idxTipo] : "N/D",
       "Tipo_Real_Airship": tipoRealAirship, 
-      "Volumen_Real_Airship": airship.delivery,
-      "Aperturas_Directas": airship.opens,
+      "Volumen_Real_Airship": volDelivery,
+      "Aperturas_Directas": volOpens,
       "Open_Rate": openRate,
       
       // Tráfico Adobe
-      "Visitas_Total": adobe.visits_Total,
-      "Bounce_Rate": adobe.bounceRate,
-      "Visits_PDP_Total": valorVisitsPDP, // Mapeo seguro a la nueva columna corregida
-      "Visits_1P": adobe.visits_1P,
-      "Visits_3P": adobe.visits_3P,
+      "Visitas_Total": visTotal,
+      "Bounce_Rate": bounceRate,
+      "Visits_PDP_Total": visPDP,
+      "Visits_1P": vis1P,
+      "Visits_3P": vis3P,
       
       // Órdenes Adobe
-      "Orders_Total": adobe.orders_Total,
-      "Orders_1P": adobe.orders_1P,
-      "Orders_3P": adobe.orders_3P,
+      "Orders_Total": ordersTotal,
+      "Orders_1P": orders1P,
+      "Orders_3P": orders3P,
       
       // Ventas Adobe
-      "Venta_Total": adobe.venta_Total,
-      "Venta_1P": adobe.venta_1P,
-      "Venta_3P": adobe.venta_3P,
+      "Venta_Total": ventaTotal,
+      "Venta_1P": venta1P,
+      "Venta_3P": venta3P,
       
       "Estado_Ejecucion": estadoEjecucion,
       "Validacion_Base": validacionBase,
       "Estado_Tracking": estadoTracking
     };
     
-    // Construcción de la fila final para la inyección respetando la estructura del molde
-    const filaEsculpida = moldeVisual.map(col => repositorio[col] !== undefined ? repositorio[col] : null);
+    const filaEsculpida = matrizEstructura.map(col => repositorio[col] !== undefined ? repositorio[col] : null);
     matrizSalida.push(filaEsculpida);
   }
   
   // =========================================================================
-  // 4. LOAD: Inyección Persistente en Bloque (BI)
+  // 4. LOAD: Inyección Persistente Segura (Truncate & Load)
   // =========================================================================
   const ssDestino = SpreadsheetApp.openById(ENTORNO.DESTINO_BI_ID);
   let destSheet = ssDestino.getSheetByName("MONITOREO_OPERATIVO");
   
   if (!destSheet) {
     destSheet = ssDestino.insertSheet("MONITOREO_OPERATIVO");
+  } else {
+    destSheet.clearContents();
   }
   
-  // Escritura atómica limpia de una sola llamada a la API de Google Sheets
-  destSheet.clearContents();
-  destSheet.getRange(1, 1, matrizSalida.length, matrizSalida[0].length).setValues(matrizSalida);
-  destSheet.autoResizeColumns(1, moldeVisual.length);
+  if (matrizSalida.length > 1) {
+    destSheet.getRange(1, 1, matrizSalida.length, matrizSalida[0].length).setValues(matrizSalida);
+  } else {
+    console.warn("⚠️ No se encontraron cruces válidos para insertar. Escribiendo solo encabezados.");
+    destSheet.getRange(1, 1, 1, matrizEstructura.length).setValues([matrizEstructura]);
+  }
   
   console.timeEnd("⏱️ Pipeline Monitoreo Operativo");
-  console.log(`💾 Persistencia completada con éxito. Columna 'Visits_PDP_Total' normalizada con flujo numérico.`);
+  console.log(`💾 Persistencia segura completada. Match ejecutado en ${conteoMatches} campañas validables.`);
 }
